@@ -1,6 +1,7 @@
-"""Possession labelling with a minimum-duration HMM decoded by Viterbi (v1: tracking + kickoff tags).
+"""Possession labelling with a minimum-duration HMM decoded by Viterbi (v2: tracking + Smart Tagging).
 
-    python solution/hmm_possession.py                    # -> evaluation/results/hmm_v1.csv
+    python solution/hmm_possession.py                    # -> evaluation/results/hmm_v2.csv
+    python solution/hmm_possession.py --no-tags          # v1 behaviour (tracking + kickoff only)
     python solution/hmm_possession.py --out my_team.csv
     python solution/hmm_possession.py --tag-report       # unsupervised check of Smart Tagging
 
@@ -20,7 +21,8 @@ persists until there is enough evidence that it changed:
                  mean player speed, fitted on this match without any labels);
   * when the ball is missing there is no team evidence, so the current state simply continues;
   * each half is decoded separately, non-causally (the whole half is seen before deciding);
-  * before the tagged 2nd-half "Kick Off (Start)" the ball is dead by definition.
+  * before the tagged 2nd-half "Kick Off (Start)" the ball is dead by definition;
+  * v2: attacking-phase Smart Tagging intervals add a small, capped nudge toward the tagged team.
 
 Nothing here is fitted on, or read from, any ground truth. Every constant is in PARAMS with the
 reason it has that value. The public 5-minute window is for checking the file, not for tuning these.
@@ -74,6 +76,28 @@ PARAMS = {
     "missing_weight": 0.05,     # ball not seen: tiny nudge toward dead
     "ball_speed_halfwin": 3,    # frames either side when smoothing ball speed
     "player_speed_halfwin": 12, # frames either side when smoothing mean player speed
+    # --- Smart Tagging team evidence (v2) ---
+    # Per-frame log-odds toward the tagged side, at most this much in total. 0.05/frame over a
+    # 10 s phase is ~12 nats: enough to settle an ambiguous stretch, while ~1 s of clear tracking
+    # evidence (0.4/frame) still overrides it.
+    "tag_weight": 0.05,
+    # Phase boundaries are approximate and phases are not possessions, so ignore this many
+    # seconds at each end of every interval.
+    "tag_trim_s": 1.0,
+}
+
+# Codes whose Team tag is the side IN POSSESSION, with a reliability factor. Chosen from the
+# unsupervised --tag-report (agreement with the nearest-player team, no labels involved):
+#   BUILD UP 76%, PROGRESSION 70% -> 1.0;  ATTACKING TRANSITION 63%, BALL IN FINAL THIRD 62%,
+#   LONG BALL 62% -> 0.5.  Box codes (52-56%) are near chance and left out. DEFENDING* and
+#   DEFENSIVE TRANSITION are exact mirrors (same intervals, Team = defending side) of the
+#   attacking codes, so using them too would count the same evidence twice.
+TAG_TEAM_CODES = {
+    "build up": 1.0,
+    "progression": 1.0,
+    "attacking transition": 0.5,
+    "ball in final third": 0.5,
+    "long ball": 0.5,
 }
 
 FIELD_SEP, GROUP_SEP = ":", ";"
@@ -331,6 +355,26 @@ def kickoff_starts(tags):
     return out
 
 
+def tag_team_evidence(tags, n, team_names, p=PARAMS):
+    """(n,) log-odds for H over A from attacking-phase tags. Positive = home in possession."""
+    score = np.zeros(n)
+    trim = int(round(p["tag_trim_s"] * FPS))
+    used = 0
+    for ev in tags:
+        factor = TAG_TEAM_CODES.get((ev["code"] or "").strip().lower())
+        if factor is None:
+            continue
+        name = (ev["tags"].get("Team") or "").strip()
+        sign = 1.0 if name == team_names[0] else -1.0 if name == team_names[1] else 0.0
+        if not sign:
+            continue
+        lo, hi = max(ev["start_frame"] + trim, 0), min(ev["end_frame"] - trim, n)
+        if hi > lo:
+            score[lo:hi] += sign * factor * p["tag_weight"]
+            used += 1
+    return np.clip(score, -p["tag_weight"], p["tag_weight"]), used
+
+
 def tag_report(tags, f, team_names):
     """For each code: how often the tag's Team matches the nearest-player team. No labels used."""
     near = np.where(f["d_home"] < f["d_away"], H, A)
@@ -358,7 +402,7 @@ def tag_report(tags, f, team_names):
 
 # -- main ----------------------------------------------------------------------------------------
 
-def run(out_path, do_tag_report=False, cache=True):
+def run(out_path, do_tag_report=False, cache=True, use_tags=True):
     meta_path = require(["atd_meta"])[0]
     names = tuple(t.findtext("Name") for t in ET.parse(meta_path).getroot().iter("Team"))
     team, px, py, ps, bx, by = load_atd(cache)
@@ -377,6 +421,12 @@ def run(out_path, do_tag_report=False, cache=True):
     kick = kickoff_starts(tags)
     if do_tag_report and tags:
         tag_report(tags, f, names)
+    if use_tags and tags:
+        tag_score, used = tag_team_evidence(tags, n, names)
+        e[:, H] += tag_score / 2
+        e[:, A] -= tag_score / 2
+        print("team evidence from {} Smart Tagging phases, on {:.0%} of graded frames".format(
+            used, np.mean(tag_score[graded] != 0)))
 
     logt = transition_logs()
     labels = np.full(n, "X", dtype="<U1")
@@ -403,9 +453,11 @@ def run(out_path, do_tag_report=False, cache=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", default=os.path.join(ROOT, "evaluation", "results", "hmm_v1.csv"))
+    parser.add_argument("--out", default=os.path.join(ROOT, "evaluation", "results", "hmm_v2.csv"))
     parser.add_argument("--tag-report", action="store_true",
                         help="print how Smart Tagging team tags line up with the tracking")
+    parser.add_argument("--no-tags", action="store_true",
+                        help="v1 behaviour: ignore Smart Tagging team evidence")
     parser.add_argument("--no-cache", action="store_true", help="re-parse the ATD every run")
     args = parser.parse_args()
-    run(args.out, args.tag_report, cache=not args.no_cache)
+    run(args.out, args.tag_report, cache=not args.no_cache, use_tags=not args.no_tags)
