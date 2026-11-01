@@ -1,6 +1,6 @@
-"""Possession labelling with a minimum-duration HMM decoded by Viterbi (v2: tracking + Smart Tagging).
+"""Possession labelling with a minimum-duration HMM decoded by Viterbi (v3: calibrated tracking + Smart Tagging).
 
-    python solution/hmm_possession.py                    # -> evaluation/results/hmm_v2.csv
+    python solution/hmm_possession.py                    # -> evaluation/results/hmm_v3.csv
     python solution/hmm_possession.py --no-tags          # v1 behaviour (tracking + kickoff only)
     python solution/hmm_possession.py --out my_team.csv
     python solution/hmm_possession.py --tag-report       # unsupervised check of Smart Tagging
@@ -12,20 +12,21 @@ persists until there is enough evidence that it changed:
 
   * three labels H / A / D, each split into MIN_FRAMES sub-states, so no label can last less than
     MIN_FRAMES frames (kills flicker without a smoothing window that blurs transitions);
-  * fixed per-frame switching probabilities derived from typical football rates, not fitted;
+  * fixed per-frame switching probabilities (calibrated on other matches, see calibration/);
   * per-frame evidence ("emissions") from the tracking only:
         - team:  which team's nearest player is closer to the ball, weighted by how close it is
                  (a ball in flight 15 m from everyone says nothing about who has it);
-        - alive: ball moving inside the pitch -> alive, ball outside the pitch or motionless -> dead,
+        - alive: ball outside the pitch or motionless -> dead,
                  players collectively slow -> dead (via an unsupervised 2-component mixture on the
                  mean player speed, fitted on this match without any labels);
   * when the ball is missing there is no team evidence, so the current state simply continues;
   * each half is decoded separately, non-causally (the whole half is seen before deciding);
   * before the tagged 2nd-half "Kick Off (Start)" the ball is dead by definition;
-  * v2: attacking-phase Smart Tagging intervals add a small, capped nudge toward the tagged team.
+  * v2: attacking-phase Smart Tagging intervals add a small, capped nudge toward the tagged team;
+  * v3: tracking constants calibrated on Metrica's open sample games (other matches).
 
-Nothing here is fitted on, or read from, any ground truth. Every constant is in PARAMS with the
-reason it has that value. The public 5-minute window is for checking the file, not for tuning these.
+Nothing here is fitted on, or read from, the competition match's ground truth. Every constant is in
+PARAMS with the reason it has that value. The public 5-minute window is for checking the file, not for tuning these.
 """
 
 import argparse
@@ -47,33 +48,36 @@ FPS = GAMES[GAME]["fps"]
 H, A, D = 0, 1, 2
 LETTERS = np.array(["H", "A", "D"])
 
-# Params -- set from football reasoning, never tuned on the public window.
+# Params. v3: the tracking constants were calibrated on three OTHER matches (Metrica's open sample
+# games, labels derived from their own event data, tracking degraded to look like the automatic
+# ATD) -- see calibration/README.md. Values marked [cal] came out of that search; the rest kept their
+# reasoned v1 values because changing them did not help there. Never tuned on the public window.
 PARAMS = {
-    # Shortest run of any label, in frames. 12 = 0.48 s: shorter "possessions" are touches/duels
-    # that a coach would not count, and they are nearly impossible to match at IoU >= 0.3 anyway.
-    "min_frames": 12,
-    # Mean seconds a team keeps the ball before the spell ends (turnover or stoppage). Typical
-    # top-flight figures are ~10-15 s per possession.
-    "alive_mean_s": 12.0,
+    # [cal] Shortest run of any label, in frames: 50 = 2 s. Shorter runs are touches and duels,
+    # which almost never match a true possession at IoU >= 0.3 and often split a real one.
+    "min_frames": 50,
+    # [cal] Prior mean seconds before a team's spell ends. Lower than the ~12 s a coach would quote
+    # because, together with the 2 s minimum above, it sets how cheaply a clear change is accepted.
+    "alive_mean_s": 6.0,
     # Of the spells that end, the share that end in a turnover rather than a stoppage.
     "turnover_share": 0.6,
     # Mean seconds of a stoppage (throw-ins short, goal kicks / fouls / subs long).
     "dead_mean_s": 15.0,
     # --- team evidence (ball visible and inside the pitch) ---
-    "team_scale_m": 2.0,        # distance gap (m) that counts as "clearly closer"
+    "team_scale_m": 1.0,        # [cal] distance gap (m) that counts as "clearly closer"
     "team_max": 0.4,            # cap on |log-odds| per frame; frames are strongly correlated
     "team_reach_m": 1.0,        # within this distance the nearest player is fully trusted
-    "team_decay_m": 3.0,        # trust halves roughly every ~2 m beyond the reach
+    "team_decay_m": 1.5,        # [cal] trust falls fast beyond the reach: only touches count
     # --- alive / dead evidence ---
     "out_margin": 0.005,        # normalised; ball beyond the line by this much is out
     "out_weight": 1.0,          # ball outside the pitch -> dead
-    "moving_mps": 2.0,          # ball faster than this inside the pitch -> alive
-    "moving_weight": 0.3,
+    "moving_mps": 2.0,          # ball faster than this inside the pitch -> alive ...
+    "moving_weight": 0.0,       # [cal] ... but it did not help: a carried dead ball moves too
     "still_mps": 0.5,           # ball slower than this -> probably placed for a restart
     "still_weight": 0.3,
     "speed_weight": 0.1,        # players-slow mixture posterior (logit) times this, ...
     "speed_clip": 0.2,          # ... clipped
-    "missing_weight": 0.05,     # ball not seen: tiny nudge toward dead
+    "missing_weight": 0.0,      # [cal] ball not seen says nothing about dead vs alive
     "ball_speed_halfwin": 3,    # frames either side when smoothing ball speed
     "player_speed_halfwin": 12, # frames either side when smoothing mean player speed
     # --- Smart Tagging team evidence (v2) ---
@@ -207,8 +211,8 @@ def gmm_slow_posterior(values, iters=100):
     return out, {"mu_mps": np.exp(mu).round(2).tolist(), "weights": w.round(2).tolist()}
 
 
-def frame_features(team, px, py, ps, bx, by, graded, p=PARAMS):
-    length, width = GAMES[GAME]["pitch"]
+def frame_features(team, px, py, ps, bx, by, graded, p=PARAMS, pitch=None):
+    length, width = pitch or GAMES[GAME]["pitch"]
     seen = ~np.isnan(bx) & ~np.isnan(by)
     m = p["out_margin"]
     out = seen & ((bx < -m) | (bx > 1 + m) | (by < -m) | (by > 1 + m))
@@ -453,7 +457,7 @@ def run(out_path, do_tag_report=False, cache=True, use_tags=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", default=os.path.join(ROOT, "evaluation", "results", "hmm_v2.csv"))
+    parser.add_argument("--out", default=os.path.join(ROOT, "evaluation", "results", "hmm_v3.csv"))
     parser.add_argument("--tag-report", action="store_true",
                         help="print how Smart Tagging team tags line up with the tracking")
     parser.add_argument("--no-tags", action="store_true",
