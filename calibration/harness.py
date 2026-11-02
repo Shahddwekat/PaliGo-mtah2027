@@ -197,6 +197,36 @@ else:
     viterbi = hp.viterbi_min_duration
 
 
+TEAM_NAMES = ("Home", "Away")
+TAG_TITLE = {"THROW IN": "Throw-in", "CORNER KICK": "Corner Kick", "GOAL KICK": "Goal Kick",
+             "FREE KICK": "Free Kick", "KICK OFF": "Kick Off", "PENALTY": "Penalty"}
+
+
+def simulate_setpiece_tags(z, rng, recall=0.6, false_rate=0.1):
+    """Set-piece tags like Smart Tagging's, from this game's own restart events.
+
+    What is copied from the competition's tagging is only its published shape: about 59 set-piece
+    tags for a match with ~90-100 restarts (so ~60% recall), an interval that starts ~3.4 s before
+    the restart (both tagged kickoffs), lasts ~5 s, and has Team = N/A on every throw-in. Jitter of
+    ~0.6 s on the start and some false tags at random moments make it imperfect.
+    """
+    out = []
+    for i, team, kind in zip(z["restart_idx"], z["restart_team"], z["restart_kind"]):
+        if rng.random() > recall:
+            continue
+        start = int(i - 85 + rng.normal(0, 15))
+        end = int(start + 125 + rng.normal(0, 25))
+        name = "N/A" if kind == "THROW IN" else TEAM_NAMES[0 if team == "H" else 1]
+        out.append({"code": "SET PIECES", "start_frame": start, "end_frame": end,
+                    "tags": {"Team": name, "Type": TAG_TITLE.get(str(kind), str(kind))}})
+    graded = np.where(z["labels"] != "X")[0]
+    for _ in range(int(false_rate * len(out))):
+        start = int(rng.choice(graded))
+        out.append({"code": "SET PIECES", "start_frame": start, "end_frame": start + 125,
+                    "tags": {"Team": TEAM_NAMES[int(rng.integers(2))], "Type": "Free Kick"}})
+    return out
+
+
 class Case:
     """One (game, scenario): degraded tracking, its features and the event-derived truth."""
 
@@ -210,10 +240,12 @@ class Case:
         arrays = degrade(z, scenario, seed)
         self.f = hp.frame_features(*arrays, graded, p=p, pitch=PITCH)
         self.raw = arrays
+        self.tags = simulate_setpiece_tags(z, np.random.default_rng(seed + 7))
 
 
 def predict(case, p):
     e = hp.emissions(case.f, p)
+    hp.apply_setpieces(e, case.tags, TEAM_NAMES, p)
     logt = hp.transition_logs(p)
     pred = np.full(len(case.lab), "X", dtype="<U1")
     for a, b in case.blocks:

@@ -1,6 +1,6 @@
-"""Possession labelling with a minimum-duration HMM decoded by Viterbi (v3: calibrated tracking + Smart Tagging).
+"""Possession labelling with a minimum-duration HMM decoded by Viterbi (v4: calibrated tracking + Smart Tagging + restarts).
 
-    python solution/hmm_possession.py                    # -> evaluation/results/hmm_v3.csv
+    python solution/hmm_possession.py                    # -> evaluation/results/hmm_v4.csv
     python solution/hmm_possession.py --no-tags          # v1 behaviour (tracking + kickoff only)
     python solution/hmm_possession.py --out my_team.csv
     python solution/hmm_possession.py --tag-report       # unsupervised check of Smart Tagging
@@ -23,7 +23,10 @@ persists until there is enough evidence that it changed:
   * each half is decoded separately, non-causally (the whole half is seen before deciding);
   * before the tagged 2nd-half "Kick Off (Start)" the ball is dead by definition;
   * v2: attacking-phase Smart Tagging intervals add a small, capped nudge toward the tagged team;
-  * v3: tracking constants calibrated on Metrica's open sample games (other matches).
+  * v3: tracking constants calibrated on Metrica's open sample games (other matches);
+  * v4: Smart Tagging SET PIECES -- dead ball just before each tagged restart, then the tagged team
+        has it (throw-ins are tagged N/A, so only the dead part applies). Calibrated on the open
+        games with simulated set-piece tags.
 
 Nothing here is fitted on, or read from, the competition match's ground truth. Every constant is in
 PARAMS with the reason it has that value. The public 5-minute window is for checking the file, not for tuning these.
@@ -58,7 +61,7 @@ PARAMS = {
     "min_frames": 50,
     # [cal] Prior mean seconds before a team's spell ends. Lower than the ~12 s a coach would quote
     # because, together with the 2 s minimum above, it sets how cheaply a clear change is accepted.
-    "alive_mean_s": 6.0,
+    "alive_mean_s": 4.0,
     # Of the spells that end, the share that end in a turnover rather than a stoppage.
     "turnover_share": 0.6,
     # Mean seconds of a stoppage (throw-ins short, goal kicks / fouls / subs long).
@@ -80,6 +83,18 @@ PARAMS = {
     "missing_weight": 0.0,      # [cal] ball not seen says nothing about dead vs alive
     "ball_speed_halfwin": 3,    # frames either side when smoothing ball speed
     "player_speed_halfwin": 12, # frames either side when smoothing mean player speed
+    # --- v4: restarts ---
+    # Ball (nearly) still within this distance of a touch/goal line, or beyond it: a throw-in,
+    # corner or goal kick being taken. [cal] Gave nothing on the open games, so off.
+    "edge_m": 1.5,
+    "edge_still_weight": 0.0,
+    # Smart Tagging SET PIECES: the tagged interval starts ~3.4 s before the restart itself
+    # (measured on the two 'Kick Off (Start)' tags against the published kickoff frames, 88 and
+    # 82 frames). Before the restart the ball is dead; after it, the tagged team has it.
+    "sp_pre_s": 3.4,
+    "sp_dead_weight": 0.2,      # [cal] per-frame push toward D over [tag start, restart)
+    "sp_team_s": 3.0,           # seconds after the restart that the tagged team gets a push
+    "sp_team_weight": 0.8,      # [cal] the team taking a restart has the ball
     # --- Smart Tagging team evidence (v2) ---
     # Per-frame log-odds toward the tagged side, at most this much in total. 0.05/frame over a
     # 10 s phase is ~12 nats: enough to settle an ambiguous stretch, while ~1 s of clear tracking
@@ -236,8 +251,10 @@ def frame_features(team, px, py, ps, bx, by, graded, p=PARAMS, pitch=None):
     slow = np.full(len(bx), np.nan)
     slow_graded, mix = gmm_slow_posterior(mean_speed[graded])
     slow[graded] = slow_graded
+    # Distance (m) from the ball to the nearest boundary line; negative outside the pitch.
+    edge = np.minimum(np.minimum(bx, 1 - bx) * length, np.minimum(by, 1 - by) * width)
     return {"seen": seen, "out": out, "d_home": d_home, "d_away": d_away,
-            "ball_speed": ball_speed, "slow": slow, "mixture": mix}
+            "ball_speed": ball_speed, "slow": slow, "mixture": mix, "edge": edge}
 
 
 def emissions(f, p=PARAMS):
@@ -251,6 +268,8 @@ def emissions(f, p=PARAMS):
     with np.errstate(invalid="ignore"):
         alive[inside & (bs > p["moving_mps"])] += p["moving_weight"]
         alive[f["seen"] & (bs < p["still_mps"])] -= p["still_weight"]
+        at_edge = f["seen"] & (f["edge"] < p["edge_m"]) & (bs < p["still_mps"])
+    alive[at_edge] -= p["edge_still_weight"]
     alive[~f["seen"]] -= p["missing_weight"]
     slow = np.clip(f["slow"], 1e-3, 1 - 1e-3)
     speed_term = np.clip(-p["speed_weight"] * np.log(slow / (1 - slow)),
@@ -379,6 +398,38 @@ def tag_team_evidence(tags, n, team_names, p=PARAMS):
     return np.clip(score, -p["tag_weight"], p["tag_weight"]), used
 
 
+def setpiece_evidence(tags, n, team_names, p=PARAMS):
+    """From SET PIECES tags: (dead, team) per-frame scores. dead > 0 pushes toward D before the
+    restart; team > 0 pushes toward home just after it (throw-ins are N/A: no team push)."""
+    dead = np.zeros(n)
+    team = np.zeros(n)
+    pre = int(round(p["sp_pre_s"] * FPS))
+    post = int(round(p["sp_team_s"] * FPS))
+    used = 0
+    for ev in tags:
+        if (ev["code"] or "").strip().lower() != "set pieces":
+            continue
+        start = max(ev["start_frame"], 0)
+        restart = min(start + pre, n)
+        if restart <= start:
+            continue
+        used += 1
+        dead[start:restart] = p["sp_dead_weight"]
+        name = (ev["tags"].get("Team") or "").strip()
+        sign = 1.0 if name == team_names[0] else -1.0 if name == team_names[1] else 0.0
+        if sign:
+            team[restart:min(restart + post, n)] = sign * p["sp_team_weight"]
+    return dead, team, used
+
+
+def apply_setpieces(e, tags, team_names, p=PARAMS):
+    dead, team, used = setpiece_evidence(tags, len(e), team_names, p)
+    e[:, H] += (team - dead) / 2
+    e[:, A] += (-team - dead) / 2
+    e[:, D] += dead / 2
+    return used
+
+
 def tag_report(tags, f, team_names):
     """For each code: how often the tag's Team matches the nearest-player team. No labels used."""
     near = np.where(f["d_home"] < f["d_away"], H, A)
@@ -431,6 +482,8 @@ def run(out_path, do_tag_report=False, cache=True, use_tags=True):
         e[:, A] -= tag_score / 2
         print("team evidence from {} Smart Tagging phases, on {:.0%} of graded frames".format(
             used, np.mean(tag_score[graded] != 0)))
+    if use_tags and tags and (PARAMS["sp_dead_weight"] or PARAMS["sp_team_weight"]):
+        print("restart evidence from {} SET PIECES tags".format(apply_setpieces(e, tags, names)))
 
     logt = transition_logs()
     labels = np.full(n, "X", dtype="<U1")
@@ -457,7 +510,7 @@ def run(out_path, do_tag_report=False, cache=True, use_tags=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", default=os.path.join(ROOT, "evaluation", "results", "hmm_v3.csv"))
+    parser.add_argument("--out", default=os.path.join(ROOT, "evaluation", "results", "hmm_v4.csv"))
     parser.add_argument("--tag-report", action="store_true",
                         help="print how Smart Tagging team tags line up with the tracking")
     parser.add_argument("--no-tags", action="store_true",

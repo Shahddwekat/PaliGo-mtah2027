@@ -13,6 +13,8 @@ truth derived *by rule* from Metrica's own event data for that game:
         BALL OUT  end frame  -> start of the next event (throw-in, corner, goal kick ...)
         SHOT that goes out / is a goal -> next event
         FAULT RECEIVED start -> next event (the free kick)
+  * every restart (set piece, goal kick) follows a stoppage: dead from the previous event's end
+    when nothing above already started one (offsides, fouls coded as challenges), at most 30 s.
   * X before the first event and after the last event of each period, and between periods.
 """
 
@@ -88,6 +90,21 @@ def labels_from_events(ev, frame_ids, periods):
             later = restarts[restarts > dead_from]
             dead_to = later[0] if len(later) else last + 1
             out[(f >= dead_from) & (f < dead_to)] = D
+        # 3. every restart follows a stoppage, even when the event that stopped play (offside, a
+        #    foul coded as a CHALLENGE) did not start one above: dead from the end of the previous
+        #    event to the restart, at most 30 s.
+        is_restart = ((pe["type"] == "SET PIECE")
+                      | ((pe["type"] == "PASS") & pe["subtype"].str.contains("GOAL KICK")))
+        prev_end = pe["end"].shift(1)
+        for i in np.where(is_restart.to_numpy())[0]:
+            if i == 0 or "KICK OFF" in pe["subtype"].iloc[i]:
+                continue
+            r = pe["start"].iloc[i]
+            j = np.searchsorted(f, r - 5)
+            if j < len(f) and out[j] == D:
+                continue
+            a = max(int(prev_end.iloc[i]), r - 30 * 25)
+            out[(f >= a) & (f < r)] = D
         out[(f < first) | (f > last)] = X
         lab[idx] = out
     return lab
@@ -145,8 +162,16 @@ def load_game(g):
     frame_ids = df["frame_id"].to_numpy()
     periods = df["period_id"].to_numpy()
     labels = labels_from_events(ev, frame_ids, periods)
+    # Restarts (used only to simulate Smart-Tagging-like set-piece tags for calibration).
+    is_restart = (ev["type"] == "SET PIECE") | ((ev["type"] == "PASS")
+                                                & ev["subtype"].str.contains("GOAL KICK"))
+    rs = ev[is_restart & ev["team"].isin([H, A])].sort_values("start")
+    kind = np.where(rs["type"] == "PASS", "GOAL KICK", rs["subtype"].str.split("-").str[0])
     out = dict(team=team, px=px, py=py, ps=ps, bx=bx, by=by, labels=labels, periods=periods,
-               pitch=np.array([105.0, 68.0]))
+               pitch=np.array([105.0, 68.0]),
+               restart_idx=np.searchsorted(frame_ids, rs["start"].to_numpy()),
+               restart_team=rs["team"].to_numpy().astype("<U1"),
+               restart_kind=kind.astype("<U16"))
     np.savez(cache, **out)
     return out
 
