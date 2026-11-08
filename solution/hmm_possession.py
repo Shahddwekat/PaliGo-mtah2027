@@ -1,6 +1,6 @@
-"""Possession labelling with a minimum-duration HMM decoded by Viterbi (v4: calibrated tracking + Smart Tagging + restarts).
+"""Possession labelling with a minimum-duration HMM decoded by Viterbi (v5: calibrated tracking + Smart Tagging + restarts + team shape).
 
-    python solution/hmm_possession.py                    # -> evaluation/results/hmm_v4.csv
+    python solution/hmm_possession.py                    # -> evaluation/results/hmm_v5.csv
     python solution/hmm_possession.py --no-tags          # v1 behaviour (tracking + kickoff only)
     python solution/hmm_possession.py --out my_team.csv
     python solution/hmm_possession.py --tag-report       # unsupervised check of Smart Tagging
@@ -26,13 +26,17 @@ persists until there is enough evidence that it changed:
   * v3: tracking constants calibrated on Metrica's open sample games (other matches);
   * v4: Smart Tagging SET PIECES -- dead ball just before each tagged restart, then the tagged team
         has it (throw-ins are tagged N/A, so only the dead part applies). Calibrated on the open
-        games with simulated set-piece tags.
+        games with simulated set-piece tags;
+  * v5: a team-shape classifier (who is moving forward, spread out, pressing the ball) trained on
+        23 external matches only -- Metrica's 3 and SkillCorner's 20 open A-League games -- adds its
+        evidence every frame, including the ~41% of frames where the ball is missing.
 
 Nothing here is fitted on, or read from, the competition match's ground truth. Every constant is in
 PARAMS with the reason it has that value. The public 5-minute window is for checking the file, not for tuning these.
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -56,16 +60,16 @@ LETTERS = np.array(["H", "A", "D"])
 # ATD) -- see calibration/README.md. Values marked [cal] came out of that search; the rest kept their
 # reasoned v1 values because changing them did not help there. Never tuned on the public window.
 PARAMS = {
-    # [cal] Shortest run of any label, in frames: 50 = 2 s. Shorter runs are touches and duels,
+    # [cal] Shortest run of any label, in frames: 75 = 3 s (v5). Shorter runs are touches and duels,
     # which almost never match a true possession at IoU >= 0.3 and often split a real one.
-    "min_frames": 50,
+    "min_frames": 75,
     # [cal] Prior mean seconds before a team's spell ends. Lower than the ~12 s a coach would quote
     # because, together with the 2 s minimum above, it sets how cheaply a clear change is accepted.
     "alive_mean_s": 4.0,
     # Of the spells that end, the share that end in a turnover rather than a stoppage.
     "turnover_share": 0.6,
-    # Mean seconds of a stoppage (throw-ins short, goal kicks / fouls / subs long).
-    "dead_mean_s": 15.0,
+    # [cal] Mean seconds of a stoppage (throw-ins short, goal kicks / fouls / subs long).
+    "dead_mean_s": 25.0,
     # --- team evidence (ball visible and inside the pitch) ---
     "team_scale_m": 1.0,        # [cal] distance gap (m) that counts as "clearly closer"
     "team_max": 0.4,            # cap on |log-odds| per frame; frames are strongly correlated
@@ -78,7 +82,10 @@ PARAMS = {
     "moving_weight": 0.0,       # [cal] ... but it did not help: a carried dead ball moves too
     "still_mps": 0.5,           # ball slower than this -> probably placed for a restart
     "still_weight": 0.3,
-    "speed_weight": 0.1,        # players-slow mixture posterior (logit) times this, ...
+    # [cal] "Players slow" = slow component of a 2-Gaussian mixture on log mean player speed,
+    # FITTED ON THE EXTERNAL MATCHES (Metrica 3 + SkillCorner dev 15, calibration/), fixed here.
+    "speed_mix": {"mu_log": [0.2126, 0.8117], "sd_log": [0.5382, 0.3638], "w": [0.4551, 0.5449]},
+    "speed_weight": 0.05,        # players-slow mixture posterior (logit) times this, ...
     "speed_clip": 0.2,          # ... clipped
     "missing_weight": 0.0,      # [cal] ball not seen says nothing about dead vs alive
     "ball_speed_halfwin": 3,    # frames either side when smoothing ball speed
@@ -92,9 +99,11 @@ PARAMS = {
     # (measured on the two 'Kick Off (Start)' tags against the published kickoff frames, 88 and
     # 82 frames). Before the restart the ball is dead; after it, the tagged team has it.
     "sp_pre_s": 3.4,
-    "sp_dead_weight": 0.2,      # [cal] per-frame push toward D over [tag start, restart)
+    "sp_dead_weight": 0.4,      # [cal] per-frame push toward D over [tag start, restart)
     "sp_team_s": 3.0,           # seconds after the restart that the tagged team gets a push
-    "sp_team_weight": 0.8,      # [cal] the team taking a restart has the ball
+    "sp_team_weight": 0.4,      # [cal] the team taking a restart has the ball
+    # --- v5: team-shape classifier (solution/shape_model.json, trained on external matches) ---
+    "shape_weight": 0.03,       # [cal] per-frame weight of its log-probabilities
     # --- Smart Tagging team evidence (v2) ---
     # Per-frame log-odds toward the tagged side, at most this much in total. 0.05/frame over a
     # 10 s phase is ~12 nats: enough to settle an ambiguous stretch, while ~1 s of clear tracking
@@ -201,8 +210,9 @@ def nan_mean_window(x, half):
         return np.where(n > 0, (vals[hi] - vals[lo]) / np.maximum(n, 1), np.nan)
 
 
-def gmm_slow_posterior(values, iters=100):
-    """P(slow component) from a 2-Gaussian mixture on log mean player speed. Unsupervised."""
+def fit_speed_mixture(values, iters=100):
+    """2-Gaussian mixture on log mean player speed. Used only OFFLINE, on external matches
+    (calibration/), to produce PARAMS["speed_mix"]; never fitted on the competition match."""
     ok = ~np.isnan(values) & (values > 0)
     x = np.log(values[ok].astype(np.float64))
     mu = np.percentile(x, [25, 75]).astype(np.float64)
@@ -217,13 +227,22 @@ def gmm_slow_posterior(values, iters=100):
         w = nk / nk.sum()
         mu = (r * x[:, None]).sum(0) / nk
         sd = np.sqrt((r * (x[:, None] - mu) ** 2).sum(0) / nk) + 1e-3
-    slow = int(np.argmin(mu))
+    order = np.argsort(mu)                                  # slow component first
+    return {"mu_log": mu[order].round(4).tolist(), "sd_log": sd[order].round(4).tolist(),
+            "w": w[order].round(4).tolist()}
+
+
+def slow_posterior(values, mix):
+    """P(slow) for each value under a FIXED mixture (PARAMS["speed_mix"])."""
+    mu, sd, w = (np.asarray(mix[k], np.float64) for k in ("mu_log", "sd_log", "w"))
     out = np.full(len(values), np.nan)
+    ok = ~np.isnan(values) & (values > 0)
+    x = np.log(values[ok].astype(np.float64))
     ll = -0.5 * ((x[:, None] - mu) / sd) ** 2 - np.log(sd) + np.log(w)
     ll -= ll.max(1, keepdims=True)
     r = np.exp(ll)
-    out[ok] = r[:, slow] / r.sum(1)
-    return out, {"mu_mps": np.exp(mu).round(2).tolist(), "weights": w.round(2).tolist()}
+    out[ok] = r[:, 0] / r.sum(1)
+    return out
 
 
 def frame_features(team, px, py, ps, bx, by, graded, p=PARAMS, pitch=None):
@@ -249,7 +268,9 @@ def frame_features(team, px, py, ps, bx, by, graded, p=PARAMS, pitch=None):
         mean_speed = np.nanmean(ps, axis=1)
     mean_speed = nan_mean_window(mean_speed, p["player_speed_halfwin"])
     slow = np.full(len(bx), np.nan)
-    slow_graded, mix = gmm_slow_posterior(mean_speed[graded])
+    slow_graded = slow_posterior(mean_speed[graded], p["speed_mix"])
+    mix = {"mu_mps": np.exp(p["speed_mix"]["mu_log"]).round(2).tolist(),
+           "weights": p["speed_mix"]["w"]}
     slow[graded] = slow_graded
     # Distance (m) from the ball to the nearest boundary line; negative outside the pitch.
     edge = np.minimum(np.minimum(bx, 1 - bx) * length, np.minimum(by, 1 - by) * width)
@@ -288,6 +309,97 @@ def emissions(f, p=PARAMS):
     e[:, A] = alive / 2 - team / 2
     e[:, D] = -alive / 2
     return e
+
+
+# -- v5: team-shape features + a classifier trained on external matches -------------------------
+
+SHAPE_FEATURES = (
+    # per team, in that team's own attacking direction (T = home, then away)
+    "d{T}", "n3{T}", "n8{T}", "cx{T}", "vx{T}", "spread{T}", "ballx{T}", "ball_minus_cx{T}",
+)
+NEUTRAL_FEATURES = ("seen", "out", "still", "ball_speed", "edge", "slow", "n_players")
+
+
+def attack_sign(team, px, blocks):
+    """+1 if home attacks toward x=1 in each block (half), from where each team stands on
+    average over that half: a team's mean position is on its own side of the pitch."""
+    sign = np.ones(px.shape[0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for first, last in blocks:
+            sl = slice(first, last + 1)
+            home = np.nanmean(px[sl][:, team == H])
+            away = np.nanmean(px[sl][:, team == A])
+            sign[sl] = 1.0 if home < away else -1.0
+    return sign
+
+
+def shape_features(team, px, py, bx, by, f, blocks, pitch=None):
+    """(n, k) per-frame features that describe each team's shape and movement around the ball.
+    They exist even when the ball is missing (players are tracked), which is where the
+    nearest-player cue alone is blind."""
+    length, width = pitch or GAMES[GAME]["pitch"]
+    n = len(bx)
+    sgn = attack_sign(team, px, blocks)
+    seen = f["seen"]
+    X = (px - 0.5) * length * sgn[:, None]           # +x = toward the away goal for home
+    Y = (py - 0.5) * width
+    BX = (bx - 0.5) * length * sgn
+    BY = (by - 0.5) * width
+    VX = np.full_like(X, np.nan)
+    VX[FPS:] = (X[FPS:] - X[:-FPS])                  # metres per second, over 1 s
+    cols = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for T, name, s in ((H, "home", 1.0), (A, "away", -1.0)):
+            m = team == T
+            x, y, vx = X[:, m] * s, Y[:, m], VX[:, m] * s   # in this team's attack frame
+            bxt = BX * s
+            d = np.sqrt((x - bxt[:, None]) ** 2 + (y - BY[:, None]) ** 2)
+            cols["d" + name] = np.where(seen, np.log1p(np.nan_to_num(np.nanmin(d, 1), nan=50.0)),
+                                        0.0)
+            cols["n3" + name] = np.where(seen, np.nansum(d < 3, 1), 0.0)
+            cols["n8" + name] = np.where(seen, np.nansum(d < 8, 1), 0.0)
+            cx = np.nanmean(x, 1)
+            cols["cx" + name] = cx / 10.0
+            cols["vx" + name] = nan_mean_window(np.nanmean(vx, 1), FPS // 2)
+            cols["spread" + name] = (np.nanstd(x, 1) + np.nanstd(y, 1)) / 10.0
+            cols["ballx" + name] = np.where(seen, bxt / 10.0, 0.0)
+            cols["ball_minus_cx" + name] = np.where(seen, (bxt - cx) / 10.0, 0.0)
+    bs = np.nan_to_num(f["ball_speed"], nan=0.0)
+    cols["seen"] = seen.astype(float)
+    cols["out"] = f["out"].astype(float)
+    cols["still"] = (seen & (bs < 0.5)).astype(float)
+    cols["ball_speed"] = np.where(seen, np.clip(bs, 0, 30) / 10.0, 0.0)
+    cols["edge"] = np.where(seen, np.clip(np.nan_to_num(f["edge"], nan=0.0), -5, 10) / 10.0, 0.0)
+    slow = np.nan_to_num(f["slow"], nan=0.5)
+    cols["slow"] = slow
+    cols["n_players"] = np.sum(~np.isnan(px), 1) / 22.0
+    names = feature_names()
+    out = np.column_stack([np.nan_to_num(np.asarray(cols[k], float), nan=0.0) for k in names])
+    return out.astype(np.float32)
+
+
+def feature_names():
+    per_team = [t.format(T=s) for s in ("home", "away") for t in SHAPE_FEATURES]
+    return per_team + list(NEUTRAL_FEATURES)
+
+
+def swap_teams(Xf):
+    """Same features with home and away exchanged (used to train a team-symmetric model)."""
+    k = len(SHAPE_FEATURES)
+    out = Xf.copy()
+    out[:, :k], out[:, k:2 * k] = Xf[:, k:2 * k], Xf[:, :k]
+    return out
+
+
+def learned_emissions(Xf, model, weight):
+    """log P(H/A/D | features) from the multinomial logistic model, times weight."""
+    z = (Xf - np.asarray(model["mean"])) / np.asarray(model["scale"])
+    logits = z @ np.asarray(model["coef"]).T + np.asarray(model["intercept"])
+    logits -= logits.max(1, keepdims=True)
+    logp = logits - np.log(np.exp(logits).sum(1, keepdims=True))
+    return weight * logp
 
 
 # -- decoding ------------------------------------------------------------------------------------
@@ -457,7 +569,17 @@ def tag_report(tags, f, team_names):
 
 # -- main ----------------------------------------------------------------------------------------
 
-def run(out_path, do_tag_report=False, cache=True, use_tags=True):
+SHAPE_MODEL = os.path.join(HERE, "shape_model.json")
+
+
+def load_shape_model(path=SHAPE_MODEL):
+    model = json.load(open(path))
+    if model["features"] != feature_names():
+        raise ValueError("{} was trained on different features".format(path))
+    return model
+
+
+def run(out_path, do_tag_report=False, cache=True, use_tags=True, use_shape=True):
     meta_path = require(["atd_meta"])[0]
     names = tuple(t.findtext("Name") for t in ET.parse(meta_path).getroot().iter("Team"))
     team, px, py, ps, bx, by = load_atd(cache)
@@ -468,9 +590,14 @@ def run(out_path, do_tag_report=False, cache=True, use_tags=True):
         graded[first:last + 1] = True
 
     f = frame_features(team, px, py, ps, bx, by, graded)
-    print("player-speed mixture (unsupervised): means {} m/s, weights {}".format(
+    print("player-speed mixture (fixed, from external matches): means {} m/s, weights {}".format(
         f["mixture"]["mu_mps"], f["mixture"]["weights"]))
     e = emissions(f)
+    if use_shape and PARAMS["shape_weight"]:
+        Xf = shape_features(team, px, py, bx, by, f, [(a, b) for _, a, b in blocks])
+        e += learned_emissions(Xf, load_shape_model(), PARAMS["shape_weight"])
+        print("team-shape evidence from {} (trained on external matches only)".format(
+            os.path.basename(SHAPE_MODEL)))
 
     tags = load_tags()
     kick = kickoff_starts(tags)
@@ -510,11 +637,14 @@ def run(out_path, do_tag_report=False, cache=True, use_tags=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", default=os.path.join(ROOT, "evaluation", "results", "hmm_v4.csv"))
+    parser.add_argument("--out", default=os.path.join(ROOT, "evaluation", "results", "hmm_v5.csv"))
     parser.add_argument("--tag-report", action="store_true",
                         help="print how Smart Tagging team tags line up with the tracking")
     parser.add_argument("--no-tags", action="store_true",
                         help="v1 behaviour: ignore Smart Tagging team evidence")
+    parser.add_argument("--no-shape", action="store_true",
+                        help="v4 behaviour: no team-shape classifier")
     parser.add_argument("--no-cache", action="store_true", help="re-parse the ATD every run")
     args = parser.parse_args()
-    run(args.out, args.tag_report, cache=not args.no_cache, use_tags=not args.no_tags)
+    run(args.out, args.tag_report, cache=not args.no_cache, use_tags=not args.no_tags,
+        use_shape=not args.no_shape)

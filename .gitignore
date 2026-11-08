@@ -64,3 +64,4 @@ env/
 .DS_Store
 calibration/metrica-sample-data/
 calibration/cache/
+calibration/skillcorner-opendata/

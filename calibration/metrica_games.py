@@ -13,8 +13,6 @@ truth derived *by rule* from Metrica's own event data for that game:
         BALL OUT  end frame  -> start of the next event (throw-in, corner, goal kick ...)
         SHOT that goes out / is a goal -> next event
         FAULT RECEIVED start -> next event (the free kick)
-  * every restart (set piece, goal kick) follows a stoppage: dead from the previous event's end
-    when nothing above already started one (offsides, fouls coded as challenges), at most 30 s.
   * X before the first event and after the last event of each period, and between periods.
 """
 
