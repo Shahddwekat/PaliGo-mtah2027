@@ -39,6 +39,8 @@ locked (`suite.py`) and was scored exactly once, for the final v4-vs-v5 decision
 | 3 (v5) | `train_shape.py` | team-shape classifier (multinomial logistic regression, team-symmetric), 3-fold leave-matches-out CV |
 | 3 (v5) | `search_v5.py` | HMM settings re-tuned with out-of-fold classifier evidence; where Metrica and SkillCorner disagreed, the value best for the weaker of the two was kept |
 | — | `errors.py` | error breakdown (wrong team, merged, split, boundaries, missed/invented stoppages) |
+| 4 | `search_v51.py` | ball-speed gate and boundary shifts: tested, not kept |
+| 5 (v6) | `train_v6.py` | classifier with memory (context features), same CV folds; weight 0.12 |
 
 ## Results (spellF1)
 
@@ -46,9 +48,10 @@ locked (`suite.py`) and was scored exactly once, for the final v4-vs-v5 decision
 |---|---|---|
 | organisers' baseline (nearest player, ±50 vote) | 0.20 | 0.20 |
 | v4 | 0.45 | 0.45 |
-| **v5** | 0.50 (out-of-fold) | **0.51** |
+| v5 | 0.50 (out-of-fold) | 0.51 |
+| **v6** | 0.56 (out-of-fold) | **0.55** |
 
-v5 beat v4 on all 5 locked matches.
+The locked matches were scored twice (v4→v5, v5→v6); each time the newer version won on all five.
 
 ## Run it
 
@@ -57,8 +60,9 @@ git clone https://github.com/metrica-sports/sample-data calibration/metrica-samp
 git clone https://github.com/SkillCorner/opendata calibration/skillcorner-opendata   # needs git-lfs
 pip install kloppy==3.18.0 numba scikit-learn
 python calibration/fit_speed_mixture.py
-python calibration/train_shape.py solution/shape_model.json
+python calibration/train_shape.py
 python calibration/search_v5.py
+python calibration/train_v6.py      # writes calibration/shape_model_v6.json -> solution/shape_model.json
 ```
 
 ## Limits

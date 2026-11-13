@@ -1,6 +1,6 @@
-"""Possession labelling with a minimum-duration HMM decoded by Viterbi (v5: calibrated tracking + Smart Tagging + restarts + team shape).
+"""Possession labelling with a minimum-duration HMM decoded by Viterbi (v6: calibrated tracking + Smart Tagging + restarts + team shape with memory).
 
-    python solution/hmm_possession.py                    # -> evaluation/results/hmm_v5.csv
+    python solution/hmm_possession.py                    # -> evaluation/results/hmm_v6.csv
     python solution/hmm_possession.py --no-tags          # v1 behaviour (tracking + kickoff only)
     python solution/hmm_possession.py --out my_team.csv
     python solution/hmm_possession.py --tag-report       # unsupervised check of Smart Tagging
@@ -29,7 +29,9 @@ persists until there is enough evidence that it changed:
         games with simulated set-piece tags;
   * v5: a team-shape classifier (who is moving forward, spread out, pressing the ball) trained on
         23 external matches only -- Metrica's 3 and SkillCorner's 20 open A-League games -- adds its
-        evidence every frame, including the ~41% of frames where the ball is missing.
+        evidence every frame, including the ~41% of frames where the ball is missing;
+  * v6: the classifier gets memory -- each team's shape over the last / next 1 s and 3 s, time
+        since / until the ball is seen, and which team was nearest it when last / next seen.
 
 Nothing here is fitted on, or read from, the competition match's ground truth. Every constant is in
 PARAMS with the reason it has that value. The public 5-minute window is for checking the file, not for tuning these.
@@ -103,7 +105,15 @@ PARAMS = {
     "sp_team_s": 3.0,           # seconds after the restart that the tagged team gets a push
     "sp_team_weight": 0.4,      # [cal] the team taking a restart has the ball
     # --- v5: team-shape classifier (solution/shape_model.json, trained on external matches) ---
-    "shape_weight": 0.03,       # [cal] per-frame weight of its log-probabilities
+    "shape_weight": 0.12,       # [cal] per-frame weight of its log-probabilities (v6)
+    # --- v5.1 candidates (off by default; kept only if they help on the external matches) ---
+    # Ball-speed gate: nearest-player evidence counts less when the ball moves fast RELATIVE to
+    # the closer player (a pass flying past an opponent is not control).
+    "gate_rel_mps": None,       # None = off; else relative speed (m/s) where the gate starts
+    "gate_decay_mps": 4.0,      # evidence x exp(-(rel - gate_rel_mps) / gate_decay_mps) above it
+    # Boundary timing: move each decoded boundary of a given kind this many frames later (+)
+    # or earlier (-). Keys: "HA" team-to-team, "AD" possession-to-dead, "DA" dead-to-possession.
+    "shift_frames": {"HA": 0, "AD": 0, "DA": 0},
     # --- Smart Tagging team evidence (v2) ---
     # Per-frame log-odds toward the tagged side, at most this much in total. 0.05/frame over a
     # 10 s phase is ~12 nats: enough to settle an ambiguous stretch, while ~1 s of clear tracking
@@ -259,6 +269,24 @@ def frame_features(team, px, py, ps, bx, by, graded, p=PARAMS, pitch=None):
     d_home = dist[:, team == H].min(1)
     d_away = dist[:, team == A].min(1)
 
+    # Speed of the ball relative to the closest player of each team (m/s), over 0.2 s.
+    lag = 5
+    rel = {}
+    with np.errstate(invalid="ignore"):
+        bvx = np.full(len(bx), np.nan)
+        bvy = np.full(len(bx), np.nan)
+        bvx[lag:] = (bx[lag:] - bx[:-lag]) * length * FPS / lag
+        bvy[lag:] = (by[lag:] - by[:-lag]) * width * FPS / lag
+        pvx = np.full_like(px, np.nan)
+        pvy = np.full_like(py, np.nan)
+        pvx[lag:] = (px[lag:] - px[:-lag]) * length * FPS / lag
+        pvy[lag:] = (py[lag:] - py[:-lag]) * width * FPS / lag
+        rows = np.arange(len(bx))
+        for T, name in ((H, "home"), (A, "away")):
+            cols = np.where(team == T)[0]
+            j = cols[np.argmin(dist[:, cols], 1)]
+            rel[name] = np.hypot(bvx - pvx[rows, j], bvy - pvy[rows, j])
+
     # Ball speed (m/s) from consecutive positions, lightly smoothed.
     step = np.hypot(np.diff(bx) * length, np.diff(by) * width) * FPS
     ball_speed = nan_mean_window(np.concatenate(([np.nan], step)), p["ball_speed_halfwin"])
@@ -275,7 +303,8 @@ def frame_features(team, px, py, ps, bx, by, graded, p=PARAMS, pitch=None):
     # Distance (m) from the ball to the nearest boundary line; negative outside the pitch.
     edge = np.minimum(np.minimum(bx, 1 - bx) * length, np.minimum(by, 1 - by) * width)
     return {"seen": seen, "out": out, "d_home": d_home, "d_away": d_away,
-            "ball_speed": ball_speed, "slow": slow, "mixture": mix, "edge": edge}
+            "ball_speed": ball_speed, "slow": slow, "mixture": mix, "edge": edge,
+            "rel_home": rel["home"], "rel_away": rel["away"]}
 
 
 def emissions(f, p=PARAMS):
@@ -301,6 +330,11 @@ def emissions(f, p=PARAMS):
     with np.errstate(invalid="ignore"):
         trust = np.exp(-np.maximum(0.0, d_min - p["team_reach_m"]) / p["team_decay_m"])
         gap = np.clip((f["d_away"] - f["d_home"]) / p["team_scale_m"], -1, 1)
+    if p.get("gate_rel_mps") is not None:
+        rel = np.where(f["d_home"] <= f["d_away"], f["rel_home"], f["rel_away"])
+        with np.errstate(invalid="ignore"):
+            over = np.maximum(0.0, np.nan_to_num(rel, nan=0.0) - p["gate_rel_mps"])
+        trust = trust * np.exp(-over / p["gate_decay_mps"])
     team = np.where(inside & np.isfinite(d_min), trust * gap * p["team_max"], 0.0)
     team = np.nan_to_num(team)
 
@@ -393,6 +427,68 @@ def swap_teams(Xf):
     return out
 
 
+# v6 candidate: the same features with memory -- each team's shape over the last / next 1 s and
+# 3 s, how long since / until the ball is seen, and which team was closest when it was last seen
+# and when it is next seen (non-causal: the whole half is known when labelling it).
+CONTEXT_BASE = ("d", "n3", "cx", "vx", "ballx")
+CONTEXT_WINDOWS = ((-75, -1), (-25, -1), (1, 25), (1, 75))
+
+
+def _window_mean(x, a, b):
+    n = len(x)
+    c = np.concatenate(([0.0], np.cumsum(x, 0) if x.ndim == 1 else np.cumsum(x, 0)))
+    i = np.arange(n)
+    lo = np.clip(i + a, 0, n)
+    hi = np.clip(i + b + 1, 0, n)
+    cnt = np.maximum(hi - lo, 1)
+    return (c[hi] - c[lo]) / (cnt if x.ndim == 1 else cnt[:, None])
+
+
+def context_feature_names():
+    per_team = ["{}{}_{}_{}".format(base, s, a, b) for s in ("home", "away")
+                for base in CONTEXT_BASE for a, b in CONTEXT_WINDOWS]
+    return feature_names() + per_team + ["since_seen_s", "until_seen_s",
+                                         "last_seen_home_closer", "next_seen_home_closer"]
+
+
+def context_features(Xf):
+    names = feature_names()
+    k = len(SHAPE_FEATURES)
+    idx = {n: i for i, n in enumerate(names)}
+    cols = []
+    for s in ("home", "away"):
+        for base in CONTEXT_BASE:
+            x = Xf[:, idx[base + s]].astype(np.float64)
+            for a, b in CONTEXT_WINDOWS:
+                cols.append(_window_mean(x, a, b))
+    seen = Xf[:, idx["seen"]] > 0.5
+    n = len(seen)
+    t = np.arange(n)
+    last = np.maximum.accumulate(np.where(seen, t, -1))
+    nxt = np.minimum.accumulate(np.where(seen, t, n)[::-1])[::-1]
+    since = np.where(last >= 0, (t - last) / FPS, 30.0)
+    until = np.where(nxt < n, (nxt - t) / FPS, 30.0)
+    closer = np.tanh(Xf[:, idx["daway"]] - Xf[:, idx["dhome"]])   # >0: home nearer the ball
+    last_c = np.where(last >= 0, closer[np.maximum(last, 0)], 0.0)
+    next_c = np.where(nxt < n, closer[np.minimum(nxt, n - 1)], 0.0)
+    extra = np.column_stack(cols + [np.minimum(since, 30) / 10, np.minimum(until, 30) / 10,
+                                    last_c, next_c])
+    return np.hstack([Xf, extra]).astype(np.float32)
+
+
+def swap_teams_context(Xc):
+    """Home/away exchanged for context features: swap the per-team blocks, negate the
+    'home closer' signs."""
+    k = len(SHAPE_FEATURES)
+    nb = len(feature_names())
+    m = len(CONTEXT_BASE) * len(CONTEXT_WINDOWS)
+    out = swap_teams(Xc[:, :nb])
+    ctx = Xc[:, nb:].copy()
+    ctx[:, :m], ctx[:, m:2 * m] = Xc[:, nb + m:nb + 2 * m], Xc[:, nb:nb + m]
+    ctx[:, -2:] = -ctx[:, -2:]
+    return np.hstack([out, ctx])
+
+
 def learned_emissions(Xf, model, weight):
     """log P(H/A/D | features) from the multinomial logistic model, times weight."""
     z = (Xf - np.asarray(model["mean"])) / np.asarray(model["scale"])
@@ -464,6 +560,28 @@ def viterbi_min_duration(e, logt, k):
         else:
             sub -= 1
     return path
+
+
+def shift_boundaries(path, shifts):
+    """Move decoded boundaries later (+k) or earlier (-k) by kind, never past a neighbour run."""
+    if not any(shifts.values()):
+        return path
+    out = path.copy()
+    b = np.where(path[1:] != path[:-1])[0] + 1
+    edges = np.concatenate(([0], b, [len(path)]))
+    for i, t in enumerate(b):
+        a, c = path[t - 1], path[t]
+        kind = "HA" if a != D and c != D else ("AD" if c == D else "DA")
+        k = int(shifts.get(kind, 0))
+        if not k:
+            continue
+        lo, hi = edges[i] + 1, edges[i + 2] - 1          # keep both runs non-empty
+        t2 = int(np.clip(t + k, lo, hi))
+        if t2 > t:
+            out[t:t2] = a
+        elif t2 < t:
+            out[t2:t] = c
+    return out
 
 
 # -- Smart Tagging -------------------------------------------------------------------------------
@@ -574,7 +692,7 @@ SHAPE_MODEL = os.path.join(HERE, "shape_model.json")
 
 def load_shape_model(path=SHAPE_MODEL):
     model = json.load(open(path))
-    if model["features"] != feature_names():
+    if model["features"] not in (feature_names(), context_feature_names()):
         raise ValueError("{} was trained on different features".format(path))
     return model
 
@@ -595,7 +713,10 @@ def run(out_path, do_tag_report=False, cache=True, use_tags=True, use_shape=True
     e = emissions(f)
     if use_shape and PARAMS["shape_weight"]:
         Xf = shape_features(team, px, py, bx, by, f, [(a, b) for _, a, b in blocks])
-        e += learned_emissions(Xf, load_shape_model(), PARAMS["shape_weight"])
+        model = load_shape_model()
+        if model["features"] == context_feature_names():          # v6: features with memory
+            Xf = context_features(Xf)
+        e += learned_emissions(Xf, model, PARAMS["shape_weight"])
         print("team-shape evidence from {} (trained on external matches only)".format(
             os.path.basename(SHAPE_MODEL)))
 
@@ -621,6 +742,7 @@ def run(out_path, do_tag_report=False, cache=True, use_tags=True, use_shape=True
             pre = min(start, last + 1) - first     # ball dead before the tagged kickoff
             eh[:pre, H] = eh[:pre, A] = -1e9
         path = viterbi_min_duration(eh, logt, PARAMS["min_frames"])
+        path = shift_boundaries(path, PARAMS["shift_frames"])
         labels[first:last + 1] = LETTERS[path]
         spells = np.sum((path[1:] != path[:-1]) & (path[1:] != D)) + int(path[0] != D)
         print("half {}: {} frames, kickoff tag at {}, {} possessions predicted".format(
@@ -637,7 +759,7 @@ def run(out_path, do_tag_report=False, cache=True, use_tags=True, use_shape=True
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", default=os.path.join(ROOT, "evaluation", "results", "hmm_v5.csv"))
+    parser.add_argument("--out", default=os.path.join(ROOT, "evaluation", "results", "hmm_v6.csv"))
     parser.add_argument("--tag-report", action="store_true",
                         help="print how Smart Tagging team tags line up with the tracking")
     parser.add_argument("--no-tags", action="store_true",
