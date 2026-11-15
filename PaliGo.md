@@ -1,7 +1,7 @@
 # PaliGo — Technical document
 
 More than a Hack 2027 · Initial Challenge · frame-level ball possession
-Team: Qais, Shahd, Dana · Repository: `PaliGo-mtah2027`
+Team: Shahd, Dana, Sara, Rahaf · Repository: `PaliGo-mtah2027`
 
 ## 1. Approach
 
@@ -27,11 +27,14 @@ half at a time, non-causally (the whole half is seen before deciding).
   2. *Ball state* — ball outside the pitch → dead; ball motionless → probably placed for a restart.
   3. *Players slowing down* — the slow component of a two-Gaussian mixture on the players' mean
      speed, a small push towards dead. The mixture is **fixed from external matches**.
-  4. *Team shape* (new in v5) — a multinomial logistic-regression classifier over 23 features per
-     frame: for each team, in its own attacking direction, distance to the ball, players within 3 m
-     and 8 m, centroid position, forward speed, spread, ball position relative to the team; plus
-     ball visibility, speed and distance to the lines. It still has evidence when the ball is
-     missing, because the players are tracked. Trained on external matches only (§3).
+  4. *Team shape with memory* (v5, extended in v6) — a multinomial logistic-regression classifier.
+     Per frame: for each team, in its own attacking direction, distance to the ball, players within
+     3 m and 8 m, centroid position, forward speed, spread, ball position relative to the team; ball
+     visibility, speed and distance to the lines (23 features). v6 adds memory: each team's distance,
+     pressure, position, forward speed and ball position averaged over the previous and next 1 s and
+     3 s, time since / until the ball is seen, and which team was nearest it when last and next seen
+     (67 features). It still has evidence when the ball is missing, because the players are
+     tracked. Trained on external matches only (§3); weight 0.12 per frame.
   5. *Smart Tagging, attacking phases* — a small capped push towards the tagged team (§2).
   6. *Smart Tagging, set pieces* — dead ball in the seconds before each tagged restart, then a push
      towards the team taking it (§2).
@@ -111,18 +114,22 @@ On the external matches (degraded as described), spellF1:
 |---|---|---|
 | organisers' baseline (nearest player, ±50-frame vote) | 0.20 | 0.20 |
 | v4 (tracking + tags + set pieces) | 0.45 | 0.45 |
-| **v5 (submitted: + team shape)** | 0.50 (out-of-fold) | **0.51** |
+| v5 (+ team shape) | 0.50 (out-of-fold) | 0.51 |
+| **v6 (submitted: team shape with memory)** | **0.56** (out-of-fold) | **0.55** |
 
-The 5 locked matches were chosen by a fixed rule before any result was seen and scored once, for
-the final decision. v5 beat v4 on all five.
+The 5 locked matches were chosen by a fixed rule before any result was seen. They were scored
+twice: once to choose v5 over v4, once to choose v6 over v5. Both times the newer version won on
+all five matches (v6 over v5: +0.03 to +0.06 per match), and v6 also improved both external
+sources in cross-validation (Metrica 0.48 → 0.53, SkillCorner 0.50 → 0.56).
 
-On the competition match (no score — we have no labels): 209 possessions, mean 16.6 s; 27.5% `H`,
-15.9% `A`, 36.3% `D`, 20.3% `X` (outside the scored halves).
+On the competition match (no score — we have no labels): 217 possessions, mean 15.7 s;
+`H` 53362 (26.8%), `A` 31648 (15.9%), `D` 73847 (37.0%), `X` 40462 (20.3%, outside the scored
+halves). Reproduction check: these counts must match exactly on any computer.
 
 **Tried and not kept.** Gating the nearest-player evidence by the ball's speed relative to that
 player, and shifting the decoded boundaries earlier or later (turnovers, stoppages, restarts):
-none improved both Metrica and SkillCorner, so v5 is unchanged. A "ball still near a line" cue for
-restarts gave nothing and is off.
+none improved both Metrica and SkillCorner, so they are off (`calibration/search_v51.py`). A
+"ball still near a line" cue for restarts gave nothing and is off.
 
 ## 6. Limitations
 
