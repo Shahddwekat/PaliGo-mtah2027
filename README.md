@@ -3,7 +3,7 @@
 Frame-by-frame ball possession (`H` / `A` / `D` / `X`) for Barcelona vs Athletic Club, LaLiga
 2024-25, from the automatic tracking data and Smart Tagging.
 
-**Team PaliGo:** Qais, Shahd, Dana.
+**Team PaliGo:** Shahd, Dana, Sara, Rahaf.
 **Technical document:** [`PaliGo.md`](PaliGo.md).
 
 ## Approach in one paragraph
