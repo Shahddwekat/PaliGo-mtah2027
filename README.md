@@ -1,26 +1,50 @@
-# PaliGo — More than a Hack 2027, Initial Challenge
+# PaliGo : ball possession from tracking data
 
-Frame-by-frame ball possession (`H` / `A` / `D` / `X`) for Barcelona vs Athletic Club, LaLiga
-2024-25, from the automatic tracking data and Smart Tagging.
+Who has the ball, every frame of a football match  Barcelona (`H`), Athletic Club (`A`), or nobody
+(`D`, dead ball) — computed automatically from tracking data and automatic event tags.
 
-**Team PaliGo:** Shahd, Dana, Sara, Rahaf.
-**Technical document:** [`PaliGo.md`](PaliGo.md).
+Built by **Team PaliGo** (Shahd, Dana, Sara, Rahaf) for **More than a Hack 2027**
+(Mobile World Capital Barcelona · Barça Innovation Hub · Metrica Sports).
 
-## Approach in one paragraph
+> **Status:** submitted to the Initial Challenge on 17 November 2026.
+> The exact submitted version is the git tag
+> [`initial-challenge-submission`](../../tree/initial-challenge-submission).
 
-Possession is treated as a **state that persists** until the evidence says it changed. A
-three-state hidden Markov model (H / A / D, minimum 3 s per run) is decoded with Viterbi over each
-half. Every frame contributes evidence from the tracking (who is touching the ball, ball out or
-still, players slowing down), from a **team-shape classifier with memory** (who is moving forward,
-spreading out, pressing over the surrounding seconds, and who was nearest the ball when it was
-last and next seen — it works even when the ball is missing), and from the automatic Smart Tagging
-(attacking phases and set pieces). Everything that was trained or tuned was trained or tuned on
-**23 external matches only** (Metrica's and SkillCorner's open data); nothing was fitted on the
-provided match, its ground truth or its video.
+## Results
 
-## Reproduce the submission
+Scored with the official metric (spellF1: each possession is an interval, matched to the truth by
+overlap) on open matches from other competitions, with the tracking degraded to look like the
+challenge data:
 
-Requirements: Python 3.10+.
+| | 18 development matches | 5 held-out test matches |
+|---|---|---|
+| Organisers' baseline (nearest player + smoothing) | 0.20 | 0.20 |
+| **PaliGo v6** | **0.56** | **0.55** |
+
+On the challenge match itself we have no labels, so no score: the model finds 217 possessions,
+15.7 s on average.
+
+## How it works
+
+1. **Possession is a state that lasts.** A hidden Markov model with three states (H / A / D)
+   only switches when the evidence is stronger than the cost of switching, and nothing shorter
+   than 3 seconds is labelled. Viterbi decodes each half as a whole.
+2. **Evidence every frame:**
+   - who is touching the ball, and whether it is out of play or standing still;
+   - a **team-shape classifier with memory**  which team is moving forward, spreading out and
+     pressing over the surrounding seconds, and who was nearest the ball when it was last seen;
+     it keeps working in the ~41% of frames where the ball is not tracked;
+   - automatic **Smart Tagging**: attacking phases and set pieces (restarts).
+3. **Trained only on other matches.** Every tuned value and the classifier come from 23 open
+   matches (Metrica Sports and SkillCorner), never from the challenge match, its answers or its
+   video.
+
+Full details: [`PaliGo.md`](PaliGo.md) (technical document) and
+[`calibration/README.md`](calibration/README.md) (how every value was chosen).
+
+## Run it
+
+Python 3.10+.
 
 ```
 git clone https://github.com/Shahddwekat/PaliGo-mtah2027.git
@@ -30,52 +54,43 @@ python -m venv .venv
 pip install -r requirements-starter.txt
 ```
 
-Put the competition data (from the enrolment link — **not included in this repo**) in
-`data/tactical/`:
-
-```
-data/tactical/BAR-ATH_tactical_atd.txt
-data/tactical/BAR-ATH_tactical_atd.xml
-data/tactical/BAR-ATH_tactical_homography.csv
-data/tactical/BAR-ATH_tactical_smart_tagging.xml
-```
-
-Then the one command that regenerates the submitted file:
+Put the challenge data (available to registered participants; **not in this repo**) in
+`data/tactical/`, then:
 
 ```
 python solution/hmm_possession.py --out evaluation/results/PaliGo.csv
 python evaluation/validate_submission.py evaluation/results/PaliGo.csv
 ```
 
-The run is deterministic (same file byte for byte on every run; checked on two computers) and
-takes a few minutes the first time (it parses and caches the tracking under `data/cache/`) and a
-few seconds after that. It uses only numpy and the standard library.
-
-The validator must end with `Valid.`; the label counts it prints are recorded in `PaliGo.md`.
+The output is deterministic: the same file, byte for byte, on every computer.
 
 ## Repository layout
 
 | Path | What |
 |---|---|
 | `solution/hmm_possession.py` | the model: features, evidence, Viterbi decoding, CSV writer |
-| `solution/shape_model.json` | the team-shape classifier (v6, with memory), trained on external matches only |
-| `calibration/` | how every tuned value was obtained, on external matches — see its README |
+| `solution/shape_model.json` | the team-shape classifier (trained on external matches) |
+| `calibration/` | training and tuning on open data from other matches |
 | `PaliGo.md` | technical document |
-| `starter/`, `evaluation/`, `games.py`, `*.md` | the organisers' challenge kit, unchanged |
-| `data/` | empty in the repo (git-ignored); the competition data goes here |
+| `starter/`, `evaluation/`, `games.py`, challenge `*.md` | the organisers' challenge kit |
+| `data/` | empty here (git-ignored); the challenge data goes here |
 
-## Rules
+## Roadmap
 
-- No competition data, derived frame-level data or video is in this repository.
-- No hand labels or human-made data on the provided match were used, for any purpose.
-- Nothing was trained, fitted or tuned on the ground truth or the video. The public 5-minute
-  ground truth was used only to check that the pipeline produces a valid, scorable file.
-- The match data was never uploaded to any AI service. `.claude/settings.json` blocks AI coding
-  tools from reading `data/`.
+Ideas we did not have time for in the Initial Challenge, and directions for the next stage:
+
+- **Untagged restarts** : recognise throw-ins, corners and goal kicks from player positions, not
+  only from tags.
+- **More training matches** : e.g. the DFL/IDSSE open Bundesliga data.
+- **Where the tracker loses the ball** : model it, instead of simulating it.
+- **From possession to analysis** : possession chains, territory and pressing maps, and a simple
+  tool that turns these labels into something a coach can read.
+
+
 
 ## Credits
 
-External open data: [Metrica Sports sample data](https://github.com/metrica-sports/sample-data)
-and [SkillCorner open data](https://github.com/SkillCorner/opendata) (MIT; credit SkillCorner and
+Open data: [Metrica Sports sample data](https://github.com/metrica-sports/sample-data) and
+[SkillCorner open data](https://github.com/SkillCorner/opendata) (MIT; credit SkillCorner and
 PySport). Challenge kit and data: Mobile World Capital Barcelona, Barça Innovation Hub and Metrica
-Sports. The organisers' kit keeps its original licence (`LICENSE`).
+Sports; the kit keeps its original licence (`LICENSE`).
